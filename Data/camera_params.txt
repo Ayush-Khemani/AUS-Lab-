@@ -1,0 +1,7 @@
+Camera params (pixel)
+fu = 625
+u0 = 480
+fv = 625
+v0 = 300
+Sphere params (meter)
+r = 0,25
