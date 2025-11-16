@@ -8,12 +8,15 @@ __pycache__/
 .idea/
 .vscode/
 
+# venv
+venv/
+
 # Data (large raw files)
 Data/Cld/
 Data/Img/
 
 # Outputs (can regenerate)
-outputs/
+
 
 # OS-generated files
 .DS_Store
