@@ -1,239 +1,272 @@
-"""
-Camera Sphere Detection → CSV Export (FIXED)
-
-NOW ONLY processes images that have matching LiDAR data!
-
-Your LiDAR frames: test_fn47, test_fn48, test_fn61, test_fn65, test_fn76, test_fn82, test_fn84, test_fn118
-Your images: Dev0/Dev1/Dev2_Image_w960_h600_fn47.jpg, etc.
-
-This script will:
-1. Find LiDAR frame numbers from centers_valid.csv
-2. ONLY process images with those frame numbers
-3. Export matching CSV for extrinsic calibration
-"""
-
+import numpy as np
+import cv2
+from scipy.optimize import least_squares
 import os
 import sys
 import csv
 import re
-import numpy as np
-from pathlib import Path
-
-from camera_calibration import CameraCalibration
+from typing import Optional, Set
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
+# 1. OPTIMIZATION FLAG
+OPTIMIZE = True 
+
+# 2. Camera Intrinsics (UPDATED based on your inputs)
+# fu = 625, fv = 625, u0 = 480, v0 = 300
 CAMERA_MATRIX = np.array([
-    [625, 0, 480],
-    [0, 625, 300],
+    [625, 0, 480],      
+    [0, 625, 300],      
     [0, 0, 1]
 ], dtype=np.float32)
 
+# Sphere Radius (meters)
 SPHERE_RADIUS = 0.25
 
+# 3. Paths
 IMAGE_DIR = "Data/Img"
-LIDAR_CSV = "outputs/centers_valid.csv"  # Your teammate's LiDAR results
+# Expects the file with the 9 rows you provided
+LIDAR_CSV = "outputs/centers_valid.csv" 
 OUTPUT_DIR = "outputs"
 OUTPUT_CSV = f"{OUTPUT_DIR}/centers_cam.csv"
 
-OPTIMIZE = True
-CANNY_LOW = 50
-CANNY_HIGH = 150
+# 4. Filter
+# Only process images containing this string (e.g. "Dev2") to avoid duplicates
+CAMERA_FILTER = "Dev2" 
 
 # ============================================================================
-# UTILITY FUNCTIONS
+# CALIBRATION LOGIC
 # ============================================================================
 
-def extract_frame_number(filename):
-    """Extract frame number from image filename."""
-    match = re.search(r'fn(\d+)', filename)
-    if match:
-        return f"fn{match.group(1)}"
-    return None
-
-
-def get_lidar_frame_numbers(lidar_csv_path):
-    """
-    Read LiDAR CSV and extract the frame numbers.
-    Returns: set of frame numbers like {'fn47', 'fn48', 'fn61', ...}
-    """
-    frame_numbers = set()
-    
-    if not os.path.exists(lidar_csv_path):
-        print(f"ERROR: LiDAR CSV not found: {lidar_csv_path}")
-        return frame_numbers
-    
-    try:
-        with open(lidar_csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                fn = row.get('fn', '').strip()
-                if fn:
-                    # Extract just the number part
-                    match = re.search(r'fn(\d+)', fn)
-                    if match:
-                        frame_numbers.add(f"fn{match.group(1)}")
-    except Exception as e:
-        print(f"ERROR reading LiDAR CSV: {e}")
-    
-    return frame_numbers
-
-
-def get_matching_images(image_dir, lidar_frames):
-    """
-    Get images that have matching LiDAR frame numbers.
-    
-    Returns: list of (filename, frame_number) tuples
-    """
-    matching_images = []
-    
-    if not os.path.exists(image_dir):
-        print(f"ERROR: Image directory not found: {image_dir}")
-        return matching_images
-    
-    image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.JPG', '.PNG')
-    
-    for filename in sorted(os.listdir(image_dir)):
-        if not filename.lower().endswith(image_extensions):
-            continue
+class CameraCalibration:
+    def __init__(self, K: np.ndarray, sphere_radius: float):
+        self.K = K
+        self.K_inv = np.linalg.inv(K)
+        self.sphere_radius = sphere_radius
         
-        frame_num = extract_frame_number(filename)
-        if frame_num and frame_num in lidar_frames:
-            matching_images.append((filename, frame_num))
+    def normalize_points(self, points: np.ndarray) -> np.ndarray:
+        """Convert pixel coordinates to normalized camera coordinates."""
+        if points.shape[1] != 2:
+            raise ValueError("Points must be (N, 2)")
+        # Add homogeneous coordinate (u, v, 1)
+        points_h = np.hstack([points, np.ones((points.shape[0], 1))])
+        # Apply inverse camera matrix
+        normalized = (self.K_inv @ points_h.T).T
+        return normalized
     
-    return matching_images
-
-
-def process_images_to_csv():
-    """Main processing function."""
-    
-    print(f"\n{'='*70}")
-    print(f"CAMERA SPHERE DETECTION → CSV EXPORT (MATCHING LIDAR FRAMES)")
-    print(f"{'='*70}")
-    
-    # Step 1: Get LiDAR frame numbers
-    print(f"\n📋 Step 1: Reading LiDAR frame numbers...")
-    lidar_frames = get_lidar_frame_numbers(LIDAR_CSV)
-    
-    if not lidar_frames:
-        print(f"ERROR: Could not read LiDAR frames from {LIDAR_CSV}")
-        return False
-    
-    print(f"  Found {len(lidar_frames)} LiDAR frames: {sorted(lidar_frames)}")
-    
-    # Step 2: Find matching images
-    print(f"\n📋 Step 2: Finding matching images...")
-    matching_images = get_matching_images(IMAGE_DIR, lidar_frames)
-    
-    if not matching_images:
-        print(f"ERROR: No matching images found!")
-        print(f"  LiDAR frames: {sorted(lidar_frames)}")
-        print(f"  Image folder: {IMAGE_DIR}")
-        return False
-    
-    print(f"  Found {len(matching_images)} matching images:")
-    for filename, frame_num in matching_images:
-        print(f"    - {filename} → {frame_num}")
-    
-    # Step 3: Process images
-    print(f"\n📋 Step 3: Processing images...")
-    cam = CameraCalibration(CAMERA_MATRIX, SPHERE_RADIUS)
-    
-    rows = [["fn", "cx", "cy", "cz"]]
-    successful = 0
-    failed = 0
-    
-    for idx, (filename, frame_num) in enumerate(matching_images, 1):
-        image_path = os.path.join(IMAGE_DIR, filename)
+    def detect_contour(self, image: np.ndarray) -> Optional[np.ndarray]:
+        """Detect the largest ellipse contour in the image."""
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
         
-        print(f"  [{idx}/{len(matching_images)}] {filename}", end="")
+        # Canny edge detection
+        edges = cv2.Canny(gray, 50, 150)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         
+        if not contours:
+            return None
+        
+        # Assume the sphere is the largest contour
+        largest_contour = max(contours, key=cv2.contourArea)
+        contour_points = largest_contour.squeeze()
+        
+        if len(contour_points.shape) < 2 or len(contour_points) < 6:
+            return None
+        
+        return contour_points.astype(np.float32)
+
+    def direct_3p_fit(self, points: np.ndarray) -> np.ndarray:
+        """
+        Algebraic solution to find sphere center from contour points.
+        Based on Tóth & Hajder (2023).
+        """
+        # Get normalized rays
+        norm_pts = self.normalize_points(points)
+        # Convert to unit vectors
+        q_vectors = norm_pts / np.linalg.norm(norm_pts, axis=1, keepdims=True)
+        Q = q_vectors.T  # Shape (3, N)
+        
+        # Solve (cos a)^-1 * w = Q^{-T} * 1
+        # Use pseudoinverse for overdetermined system (>3 points)
+        Q_pinv_T = np.linalg.pinv(Q.T)
+        ones = np.ones(len(points))
+        
+        term = Q_pinv_T @ ones
+        
+        # Recover cone axis (w) and angle (alpha)
+        norm_term = np.linalg.norm(term)
+        w = term / norm_term
+        cos_alpha = 1.0 / norm_term
+        
+        # Calculate distance to sphere center: d = r / sin(alpha)
+        # sin(alpha) = sqrt(1 - cos^2(alpha))
+        sin_alpha = np.sqrt(1 - cos_alpha**2)
+        dist = self.sphere_radius / sin_alpha
+        
+        # Sphere center s = dist * w
+        s = dist * w
+        return s
+    
+    def optimize_center(self, init_center: np.ndarray, contour_points: np.ndarray) -> np.ndarray:
+        """
+        Non-linear optimization minimizing the difference between the 
+        sphere radius and the distance from the center to each back-projected ray.
+        """
+        # Pre-compute unit rays for all contour points
+        norm_pts = self.normalize_points(contour_points)
+        rays = norm_pts / np.linalg.norm(norm_pts, axis=1, keepdims=True)
+        
+        def residuals(s):
+            # Distance from point 's' to line defined by unit vector 'ray' passing through origin
+            # dist = || s - (s . ray) * ray ||
+            
+            # Vectorized projection of s onto all rays
+            # dot_products shape: (N,)
+            dot_products = np.dot(rays, s) 
+            
+            # projections shape: (N, 3)
+            projections = rays * dot_products[:, np.newaxis]
+            
+            # distances to lines (rays)
+            distances_to_rays = np.linalg.norm(s - projections, axis=1)
+            
+            # We want these distances to equal the sphere radius
+            # residual = dist - r
+            return distances_to_rays - self.sphere_radius
+
+        # Run Least Squares optimization
+        res = least_squares(residuals, init_center, loss='soft_l1', f_scale=0.1)
+        return res.x
+
+    def process(self, image_path: str, optimize: bool = True) -> Optional[np.ndarray]:
+        image = cv2.imread(image_path)
+        if image is None: 
+            return None
+        
+        # 1. Detect
+        points = self.detect_contour(image)
+        if points is None: 
+            return None
+        
+        # 2. Initial Estimate
         try:
-            result = cam.process_image(image_path, optimize=OPTIMIZE)
+            center = self.direct_3p_fit(points)
+        except:
+            return None
+        
+        # 3. Optimize
+        if optimize:
+            center = self.optimize_center(center, points)
             
-            if result is None:
-                print(" ✗ Detection failed")
-                failed += 1
-                continue
-            
-            sphere_center = result['sphere_center']
-            cx, cy, cz = sphere_center[0], sphere_center[1], sphere_center[2]
-            
-            # Convert to teammate's format: add "test_" prefix
-            # Your frame: "fn47" → Teammate's frame: "test_fn47"
-            test_frame_num = f"test_{frame_num}"
-            rows.append([test_frame_num, f"{cx:.6f}", f"{cy:.6f}", f"{cz:.6f}"])
-            
-            print(f" ✓")
-            successful += 1
-            
-        except Exception as e:
-            print(f" ✗ ERROR: {e}")
-            failed += 1
-    
-    # Step 4: Write CSV
-    print(f"\n📋 Step 4: Writing CSV...")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerows(rows)
-    
-    # Results
-    print(f"\n{'='*70}")
-    print(f"RESULTS")
-    print(f"{'='*70}")
-    print(f"Successful: {successful}/{len(matching_images)}")
-    print(f"Failed:     {failed}/{len(matching_images)}")
-    print(f"\n✓ CSV saved to: {OUTPUT_CSV}")
-    print(f"\nCSV Content (first 10 rows):")
-    print(f"{'─'*70}")
-    
-    if len(rows) > 1:
-        for row in rows[:min(11, len(rows))]:
-            print(f"{row[0]},{row[1]},{row[2]},{row[3]}")
-        if len(rows) > 11:
-            print(f"... ({len(rows)-1} total frames)")
-    
-    print(f"{'─'*70}\n")
-    
-    return True
+        return center
 
+# ============================================================================
+# FILE & MATCHING UTILS
+# ============================================================================
+
+def get_target_frames(csv_path: str) -> Set[str]:
+    """
+    Reads your teammate's CSV (test_fnXX) and returns a set of 'XX' strings.
+    """
+    targets = set()
+    if not os.path.exists(csv_path):
+        print(f"ERROR: Could not find {csv_path}")
+        return targets
+        
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fn_str = row.get('fn', '')
+            # Extract number from 'test_fn118' -> '118'
+            match = re.search(r'fn(\d+)', fn_str)
+            if match:
+                targets.add(match.group(1))
+    return targets
+
+def find_images(img_dir: str, target_frames: Set[str]) -> list:
+    """
+    Finds images in img_dir that match the target frame numbers.
+    Returns list of (filename, frame_number_string).
+    """
+    found = []
+    if not os.path.exists(img_dir):
+        print(f"ERROR: Could not find {img_dir}")
+        return found
+        
+    print(f"Scanning {img_dir} for frames: {sorted(list(target_frames))}")
+    
+    for fname in sorted(os.listdir(img_dir)):
+        # 1. Check extension
+        if not fname.lower().endswith(('.jpg', '.png', '.bmp')):
+            continue
+            
+        # 2. Apply Camera Filter (e.g. "Dev2")
+        if CAMERA_FILTER not in fname:
+            continue
+            
+        # 3. Extract Frame Number
+        match = re.search(r'fn(\d+)', fname)
+        if match:
+            num = match.group(1)
+            if num in target_frames:
+                found.append((fname, num))
+                
+    return found
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
 def main():
-    """Main execution."""
+    print("--- STARTING CAMERA SPHERE DETECTION ---")
     
-    print("\n")
-    print("╔" + "="*68 + "╗")
-    print("║" + " "*10 + "CAMERA DETECTION → CSV (MATCHING LIDAR)" + " "*20 + "║")
-    print("╚" + "="*68 + "╝")
-    
-    try:
-        success = process_images_to_csv()
-        
-        if success:
-            print("✓ COMPLETE!\n")
-            print("📤 Next steps:")
-            print(f"  1. Verify CSV looks correct")
-            print(f"  2. Send to teammate for compute_extrinsic.py")
-            print(f"  3. Frame names now match her LiDAR data!\n")
-            return 0
-        else:
-            print("✗ FAILED\n")
-            return 1
-            
-    except Exception as e:
-        print(f"\n✗ ERROR: {e}\n")
-        import traceback
-        traceback.print_exc()
-        return 1
+    # 1. Load Targets
+    target_frames = get_target_frames(LIDAR_CSV)
+    if not target_frames:
+        print("No target frames found in CSV. Exiting.")
+        return
+    print(f"Loaded {len(target_frames)} target frames from CSV.")
 
+    # 2. Find Images
+    images_to_process = find_images(IMAGE_DIR, target_frames)
+    if not images_to_process:
+        print("No matching images found. Check filenames/paths.")
+        return
+    print(f"Found {len(images_to_process)} matching images.")
+
+    # 3. Process
+    calib = CameraCalibration(CAMERA_MATRIX, SPHERE_RADIUS)
+    results = []
+    
+    for fname, fnum in images_to_process:
+        path = os.path.join(IMAGE_DIR, fname)
+        print(f"Processing {fname}...", end="")
+        
+        center = calib.process(path, optimize=OPTIMIZE)
+        
+        if center is not None:
+            # Format: fn, cx, cy, cz
+            # Note: We reconstruct 'test_fnXX' to match teammate's format
+            row_id = f"test_fn{fnum}"
+            results.append([row_id, center[0], center[1], center[2]])
+            print(f" OK -> {center}")
+        else:
+            print(f" FAILED (No contour?)")
+
+    # 4. Save Output
+    if results:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['fn', 'cx', 'cy', 'cz']) # Header
+            writer.writerows(results)
+        print(f"\nSuccessfully saved {len(results)} rows to {OUTPUT_CSV}")
+    else:
+        print("\nNo results generated.")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
